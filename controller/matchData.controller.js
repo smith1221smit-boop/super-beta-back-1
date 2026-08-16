@@ -204,8 +204,13 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
 
     const matchDatas = await MatchData.find({ matchId: { $in: matches.map(m => m._id) } });
 
+    const io = getSocket();
+
     for (const matchData of matchDatas) {
       let changed = false;
+      // Per-team diffs collected as we go, so we can push exactly what
+      // changed to live listeners after save instead of re-diffing.
+      const changedTeams = [];
 
       for (const slot of group.slots || []) {
         if (!slot.team) continue;
@@ -219,39 +224,65 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
 
         if (!existing) {
           // Brand new team in this slot — add it.
+          const teamName = slot.team.teamFullName || slot.team.teamName || '';
+          const teamTag = slot.team.teamTag || '';
+          const teamLogo = slot.team.logo || '';
           matchData.teams.push({
             slot: slot.slot,
             teamId: slot.team._id,
-            teamLogo: slot.team.logo || '',
-            teamName: slot.team.teamFullName || slot.team.teamName || '',
-            teamTag: slot.team.teamTag || '',
+            teamLogo,
+            teamName,
+            teamTag,
             players: freshPlayers,
           });
           changed = true;
+          changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players: freshPlayers } });
         } else if (String(existing.teamId) !== String(slot.team._id)) {
           // Slot's team was swapped — replace identity/roster, drop stale stats.
+          const teamName = slot.team.teamFullName || slot.team.teamName || '';
+          const teamTag = slot.team.teamTag || '';
+          const teamLogo = slot.team.logo || '';
           existing.teamId = slot.team._id;
           existing.slot = slot.slot;
-          existing.teamLogo = slot.team.logo || '';
-          existing.teamName = slot.team.teamFullName || slot.team.teamName || '';
-          existing.teamTag = slot.team.teamTag || '';
+          existing.teamLogo = teamLogo;
+          existing.teamName = teamName;
+          existing.teamTag = teamTag;
           existing.players = freshPlayers;
           changed = true;
+          changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players: freshPlayers } });
         } else {
           // Same team — only refresh display metadata, never touch live stats/roster.
           const teamName = slot.team.teamFullName || slot.team.teamName || '';
           const teamTag = slot.team.teamTag || '';
           const teamLogo = slot.team.logo || '';
+          const fieldChanges = {};
           if (existing.slot !== slot.slot) { existing.slot = slot.slot; changed = true; }
-          if (existing.teamName !== teamName) { existing.teamName = teamName; changed = true; }
-          if (existing.teamTag !== teamTag) { existing.teamTag = teamTag; changed = true; }
-          if (existing.teamLogo !== teamLogo) { existing.teamLogo = teamLogo; changed = true; }
+          if (existing.teamName !== teamName) { existing.teamName = teamName; changed = true; fieldChanges.teamName = teamName; }
+          if (existing.teamTag !== teamTag) { existing.teamTag = teamTag; changed = true; fieldChanges.teamTag = teamTag; }
+          if (existing.teamLogo !== teamLogo) { existing.teamLogo = teamLogo; changed = true; fieldChanges.teamLogo = teamLogo; }
+          if (Object.keys(fieldChanges).length > 0) {
+            changedTeams.push({ teamId: existing.teamId, changes: fieldChanges });
+          }
         }
       }
 
       if (changed) {
         matchData.markModified('teams');
         await matchData.save();
+
+        // Push to the operator console (per-team, same event/shape every other
+        // MatchData mutation already uses) and to the public overlay's round
+        // room (via the existing manual-edit broadcast helper), so a team
+        // rename/logo swap shows up immediately instead of waiting on the
+        // console's next fetch or the overlay's poll fallback.
+        for (const { teamId, changes } of changedTeams) {
+          io.to(`user:${matchData.userId}`).emit('matchDataUpdated', {
+            matchDataId: matchData._id,
+            teamId,
+            changes,
+          });
+        }
+        emitOverallUpdateAsync(io, matchData.matchId, matchData.userId, matchData.toObject());
       }
     }
   } catch (error) {

@@ -12,6 +12,13 @@ const mongoose = require('mongoose');
 const knownPlayersCache = new Map(); // matchId -> { uids: Set<string>, expiresAt }
 const KNOWN_PLAYERS_CACHE_TTL_MS = 10000;
 
+// Case-fold and strip whitespace/punctuation/symbols (Unicode-aware) before
+// comparing names for the roster-reconciliation fallback below — same
+// normalization pubgApiMatchData.controller.js applies for its own
+// name-based match. Duplicated locally rather than imported: that file
+// already requires this one, so importing back would be a require cycle.
+const normalizeNameForMatch = name => String(name).toLowerCase().replace(/[\p{P}\p{S}\p{Z}]/gu, '');
+
 /**
  * Update Teams DB with API players already resolved to a team.
  *
@@ -28,6 +35,15 @@ const KNOWN_PLAYERS_CACHE_TTL_MS = 10000;
  * mapping removes that coincidental-collision path entirely, since a player
  * only reaches here once the caller's continuity/empirical-mapping logic has
  * actually placed them on this team.
+ *
+ * A resolved player is reconciled against the existing roster in three
+ * ordered steps: (1) exact playerId match — already registered, just sync
+ * playerName if it changed in-game; (2) no playerId match but an existing
+ * roster entry has the same normalized name — that entry's playerId is
+ * almost certainly a typo/stale value (the dominant real cause of a player
+ * staying unmatched, per the name-fallback in pubgApiMatchData.controller.js),
+ * so correct it in place rather than treating this as a new player; (3)
+ * neither matches — genuinely new player, appended if the team has room.
  *
  * @param {Map<string, Array>} resolvedPlayersByTeamId - team DB _id (string) -> apiPlayer[]
  * @param {String} matchId - only used for the knownPlayersCache key/logging
@@ -75,6 +91,8 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
 
     const MAX_PLAYERS = 4;
     const modifiedTeams = new Set();
+    let nameSyncCount = 0;
+    let reconciledCount = 0;
 
     for (const [teamDbId, apiPlayersForTeam] of resolvedPlayersByTeamId) {
       const team = teamMap[teamDbId];
@@ -84,8 +102,16 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
         const uId = apiPlayer.uId;
         if (!uId || uId === 'undefined' || uId === '') continue;
 
-        const exists = team.players.some(p => String(p.playerId) === String(uId));
-        if (exists) {
+        const latestName = typeof apiPlayer.playerName === 'string' ? apiPlayer.playerName.trim() : '';
+
+        // Case 1: exact playerId match — already registered correctly.
+        const existingByUid = team.players.find(p => String(p.playerId) === String(uId));
+        if (existingByUid) {
+          if (latestName && existingByUid.playerName !== latestName) {
+            existingByUid.playerName = latestName;
+            modifiedTeams.add(team);
+            nameSyncCount++;
+          }
           skipCount++;
           continue;
         }
@@ -96,12 +122,38 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
           continue;
         }
 
-        if (team.players.length >= MAX_PLAYERS) continue;
+        // Case 2: no playerId match, but an existing roster entry has the
+        // same (normalized) name — that entry's stored playerId is almost
+        // certainly wrong/stale rather than this being a different person.
+        // Correct it in place instead of falling through to the
+        // MAX_PLAYERS-capped "new player" path below, which would silently
+        // drop this player forever on any already-full roster.
+        const apiNameNorm = latestName && normalizeNameForMatch(latestName);
+        const placeholder = apiNameNorm
+          ? team.players.find(p => p.playerName && normalizeNameForMatch(p.playerName) === apiNameNorm)
+          : null;
 
-        // Add new player
+        if (placeholder) {
+          placeholder.playerId = String(uId);
+          if (!placeholder.photo && apiPlayer.picUrl) {
+            placeholder.photo = apiPlayer.picUrl;
+          }
+          modifiedTeams.add(team);
+          knownUidToTeamId.set(String(uId), String(team._id));
+          allKnownUids.add(String(uId));
+          reconciledCount++;
+          continue;
+        }
+
+        // Case 3: genuinely new player.
+        if (team.players.length >= MAX_PLAYERS) {
+          console.warn(`[roster-full] match=${matchKey} team=${team._id} uId=${uId} playerName="${latestName}" — team already has ${MAX_PLAYERS} players and no name match; not added`);
+          continue;
+        }
+
         team.players.push({
           _id: new mongoose.Types.ObjectId(),
-          playerName: apiPlayer.playerName || '',
+          playerName: latestName,
           playerId: String(uId),
           photo: apiPlayer.picUrl || ''
         });
@@ -134,6 +186,12 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
     // Finished - silent
     if (skipCount > 0) {
       console.log(`[EXISTS] ${skipCount} players`);
+    }
+    if (reconciledCount > 0) {
+      console.log(`[RECONCILED] ${reconciledCount} players (playerId corrected via name match)`);
+    }
+    if (nameSyncCount > 0) {
+      console.log(`[NAME-SYNC] ${nameSyncCount} players renamed`);
     }
   } catch (err) {
     console.error('Error updating teams:', err);

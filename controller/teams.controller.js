@@ -1,6 +1,8 @@
 // controllers/teams.controller.js
 const Team = require('../models/teams.model.js');
 const User = require('../models/User.model.js');
+const Group = require('../models/group.model.js');
+const { syncMatchDataTeamsForGroup } = require('./matchData.controller.js');
 const mongoose = require('mongoose');
 
 // Default assets
@@ -277,6 +279,17 @@ const updateTeam = async (req, res) => {
     ).lean();
 
     if (!updatedTeam) return res.status(404).json({ error: 'Team not found' });
+
+    // Any match already created for this team snapshotted its display fields
+    // into MatchData at creation time (see createMatchDataForMatchDoc) and
+    // never re-reads from Team afterwards. Re-run the same reconciliation a
+    // Group-slot resave already triggers so a rename/logo change here shows
+    // up in already-created matches too, instead of only in future ones.
+    if (setOps.teamFullName || setOps.teamTag || setOps.logo !== undefined) {
+      Group.find({ 'slots.team': updatedTeam._id }).select('_id').lean()
+        .then(groups => Promise.all(groups.map(g => syncMatchDataTeamsForGroup(g._id))))
+        .catch(err => console.error(`[TEAMS] Failed to sync MatchData after team update id=${req.params.id}:`, err.message));
+    }
 
     console.log(`[TEAMS] updated id=${req.params.id} players=${updatedTeam.players.length}`);
     res.json(sanitizeTeam(updatedTeam, req.session?.userId));
