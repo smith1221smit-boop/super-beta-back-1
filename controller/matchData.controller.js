@@ -7,6 +7,8 @@ const { getSocket } = require('../socket.js');
 const mongoose = require('mongoose');
 const { computeOverallMatchDataForRound } = require('./overall.controller');
 const { encodeMsgpack } = require('../utils/msgpackCodec');
+const { emitToRoomSplitByFormat } = require('../utils/roomEmit');
+const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../utils/protobufCodec');
 
 // ─── Shared player-template builder ───────────────────────────────────────────
 // Was previously copy-pasted 3x (create / replace / add) with small drifts
@@ -15,7 +17,7 @@ const { encodeMsgpack } = require('../utils/msgpackCodec');
 // it means all three paths always produce an identically-shaped player.
 function buildFreshPlayer(sourcePlayer, teamSlot, teamName) {
   return {
-    uId: sourcePlayer.playerId || '',
+    uId: sourcePlayer.playerId || sourcePlayer.uId || '',
     _id: sourcePlayer._id,
     playerName: sourcePlayer.playerName,
     playerOpenId: sourcePlayer.playerOpenId || '',
@@ -111,13 +113,17 @@ function emitOverallUpdateAsync(io, matchId, userId, matchData) {
         console.warn(`[socket] emitOverallUpdateAsync: no Match found for matchId=${matchId} — nothing emitted`);
         return;
       }
-      const room = `round:${match.tournamentId}:${match.roundId}`;
-      const socketsInRoom = io.sockets.adapter.rooms.get(room)?.size || 0;
-      console.log(`[socket] emitOverallUpdateAsync: room=${room} has ${socketsInRoom} socket(s) currently joined`);
+      const matchDataRoom = `round:${match.tournamentId}:${match.roundId}:matchData`;
+      const overallRoom = `round:${match.tournamentId}:${match.roundId}:overall`;
+      console.log(`[bw][emit] emitOverallUpdateAsync: matchDataRoom=${matchDataRoom} (${io.sockets.adapter.rooms.get(matchDataRoom)?.size || 0} sockets) overallRoom=${overallRoom} (${io.sockets.adapter.rooms.get(overallRoom)?.size || 0} sockets)`);
 
       if (matchData) {
-        io.to(room).emit('liveMatchUpdate', encodeMsgpack({ ...matchData, matchId: String(matchId) }));
-        console.log(`[socket] liveMatchUpdate -> ${room} match=${matchId}`);
+        emitToRoomSplitByFormat(io, matchDataRoom, 'liveMatchUpdate', {
+          protoMessageName: 'MatchDataPayload',
+          mapToProto: toProtoMatchDataPayload,
+          data: { ...matchData, matchId: String(matchId) },
+          volatile: false,
+        });
       }
 
       return computeOverallMatchDataForRound(match.tournamentId, match.roundId, matchId, userId)
@@ -129,9 +135,16 @@ function emitOverallUpdateAsync(io, matchId, userId, matchData) {
             teams: overallTeams,
             createdAt: new Date(),
           };
-          console.log(`[socket] overallDataUpdate -> user:${userId} + ${room} match=${matchId}`);
-          io.to(`user:${userId}`).emit('overallDataUpdate', overallPayload);
-          io.to(room).emit('overallDataUpdate', encodeMsgpack(overallPayload));
+          // NOTE: no `user:${userId}` emit here — confirmed zero consumers
+          // of overallDataUpdate on that room anywhere in front/ or
+          // desktop-app/. Removed as dead traffic; see plan step 1.
+          console.log(`[bw][overall] overallDataUpdate -> ${overallRoom} match=${matchId} teams=${overallTeams.length}`);
+          emitToRoomSplitByFormat(io, overallRoom, 'overallDataUpdate', {
+            protoMessageName: 'OverallDataPayload',
+            mapToProto: toProtoOverallDataPayload,
+            data: overallPayload,
+            volatile: false,
+          });
         });
     })
     .catch(err => console.warn('Failed to emit overall data update:', err.message));
@@ -843,6 +856,96 @@ const removePlayersFromTeamInMatchData = async (req, res) => {
   }
 };
 
+// Bulk-copies the auto-detected previous match's roster (in the same round,
+// the match with the highest matchNo below this one) into this match, one
+// team at a time, matched by their shared Team ref (teamId) since a team's
+// MatchData subdocument _id differs per match. Only playerName/uId survive
+// the copy — buildFreshPlayer resets every live-stat field, exactly as if
+// the player had just been added new. Teams with no counterpart in the
+// previous match's roster are left untouched and reported in skippedTeams
+// rather than erased.
+const copyRosterFromPreviousMatch = async (req, res) => {
+  try {
+    const { matchDataId } = req.params;
+    if (!req.session || !req.session.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(matchDataId)) {
+      return res.status(400).json({ error: 'Invalid ObjectId format for matchDataId' });
+    }
+
+    const matchData = await MatchData.findOne({ _id: matchDataId, userId: req.session.userId });
+    if (!matchData) return res.status(404).json({ error: 'MatchData not found or not yours' });
+
+    const currentMatch = await Match.findById(matchData.matchId).lean();
+    if (!currentMatch) return res.status(404).json({ error: 'Match not found for this MatchData' });
+
+    const previousMatch = await Match.findOne({
+      tournamentId: currentMatch.tournamentId,
+      roundId: currentMatch.roundId,
+      userId: req.session.userId,
+      matchNo: { $lt: currentMatch.matchNo },
+    }).sort({ matchNo: -1, _id: -1 }).lean();
+    if (!previousMatch) {
+      return res.status(404).json({ error: 'No previous match found in this round', reason: 'no_previous_match' });
+    }
+
+    const previousMatchData = await MatchData.findOne({ matchId: previousMatch._id, userId: req.session.userId }).lean();
+    if (!previousMatchData) {
+      return res.status(404).json({ error: 'Previous match has no roster data yet', reason: 'no_previous_matchdata' });
+    }
+
+    const updatedTeams = [];
+    const skippedTeams = [];
+
+    for (const team of matchData.teams) {
+      const prevTeam = (previousMatchData.teams || []).find(pt => matchesTeamId(pt, String(team.teamId)));
+      if (!prevTeam) {
+        skippedTeams.push({ teamId: team.teamId, teamName: team.teamName });
+        continue;
+      }
+
+      // _id is stripped before buildFreshPlayer: its default passthrough
+      // (`_id: sourcePlayer._id`) is correct for its other callers (stable
+      // Team-roster player ids) but here the source _id belongs to a
+      // DIFFERENT match's MatchData subdocument and must never be reused —
+      // omitting it lets Mongoose assign a fresh id.
+      team.players = (prevTeam.players || [])
+        .slice(0, 4)
+        .map(({ _id, ...rest }) => buildFreshPlayer(rest, team.slot, team.teamName));
+
+      updatedTeams.push({ teamId: team.teamId, teamName: team.teamName, players: team.players });
+    }
+
+    if (updatedTeams.length > 0) {
+      matchData.markModified('teams');
+      await matchData.save();
+
+      const io = getSocket();
+      for (const ut of updatedTeams) {
+        console.log(`[socket] matchDataUpdated -> user:${req.session.userId} team=${ut.teamId} roster-copied`);
+        io.to(`user:${req.session.userId}`).emit('matchDataUpdated', {
+          matchDataId,
+          teamId: ut.teamId,
+          changes: { players: ut.players },
+        });
+      }
+    }
+
+    return res.json({
+      message: 'Roster copied from previous match',
+      matchDataId,
+      previousMatchId: previousMatch._id,
+      previousMatchNo: previousMatch.matchNo,
+      updatedTeams,
+      skippedTeams,
+    });
+  } catch (error) {
+    console.error('Error copying roster from previous match:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
 // Surfaces which live players in this match currently have no roster match
 // (see markUnmatched/getUnmatchedPlayers in pubgApiMatchData.controller.js)
 // so an operator can fix a bad UID instead of it silently never working —
@@ -876,6 +979,7 @@ module.exports = {
   updatePlayerByIdInMatchData,
   addPlayersToTeamInMatchData,
   removePlayersFromTeamInMatchData,
+  copyRosterFromPreviousMatch,
   updateTeamPlayersBulkStats,
   getUnmatchedPlayersForMatch,
 };

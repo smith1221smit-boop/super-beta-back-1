@@ -9,7 +9,8 @@
     "dev": "nodemon index.js",
     "start": "node index.js",
     "build": "node build.js",
-    "package": "pkg . --out-path build --targets node18-win-x64"
+    "package": "pkg . --out-path build --targets node18-win-x64",
+    "proto:gen": "pbjs -t static-module -w commonjs -o proto/overlay.pb.js proto/overlay.proto && pbts -o proto/overlay.pb.d.ts proto/overlay.pb.js"
   },
   "keywords": [],
   "author": "",
@@ -45,6 +46,7 @@
     "jsonwebtoken": "^9.0.2",
     "lodash": "^4.17.21",
     "mongoose": "^8.16.3",
+    "protobufjs": "^8.7.2",
     "simple-git": "^3.30.0",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.3"
@@ -52,6 +54,7 @@
   "devDependencies": {
     "cross-env": "^10.1.0",
     "nodemon": "^3.1.10",
-    "pkg": "^5.8.1"
+    "pkg": "^5.8.1",
+    "protobufjs-cli": "^2.6.2"
   }
 }

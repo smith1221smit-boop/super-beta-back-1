@@ -13,17 +13,15 @@ const { aggregateOverallTeams } = require('./overall.controller');
    Same view -> data-requirement tables as the frontend
    (PublicThemeRenderer.tsx), kept in sync manually. If you add a view
    there that needs a new data source, mirror it here too.
+
+   VIEWS_NEEDING_OVERALL / VIEWS_NEEDING_MATCH_DATA are hoisted to
+   utils/viewDataTiers.js — the socket layer (pubgApiMatchData.controller.js
+   joinRoundRoom) needs the exact same two sets to decide which
+   round:${tid}:${rid}:* sub-room a socket joins, and importing one shared
+   copy keeps this file's HTTP-bulk logic and the socket-room logic from
+   drifting apart within this repo.
 -------------------------------------------------------------------- */
-const VIEWS_NEEDING_OVERALL = new Set([
-  'OverAllData', 'OverallFrags', 'LiveStats', '1stRunnerUp', '2ndRunnerUp', 'EventMvp', 'highlightPoints',
-  'Champions',
-]);
-const VIEWS_NEEDING_MATCH_DATA = new Set([
-  'Upper', 'Dom', 'Alerts', 'LiveStats', 'LiveFrags', 'MatchData', 'Achive', 'MatchFragrs',
-  'WwcdSummary', 'WwcdStats', 'playerH2H', 'mapPreview', 'slots', 'TeamH2H', 'mvp',
-  'RosterShowCase', 'MatchSummary', 'Champions', '1stRunnerUp', '2ndRunnerUp', 'EventMvp',
-  'PlayerSwitch', 'LiveData',
-]);
+const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA } = require('../utils/viewDataTiers');
 const VIEWS_NEEDING_BACKPACK = new Set(['Upper']);
 const VIEWS_NEEDING_MATCHES_LIST = new Set([
   'Lower', 'Schedule', 'HighlightSchedule', 'OverAllData', 'OverallFrags', 'highlightPoints' , 'EventMvp',,

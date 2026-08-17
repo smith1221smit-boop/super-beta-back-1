@@ -38,12 +38,21 @@ function initializeSocket(server) {
       allowedHeaders: ["Content-Type", "Authorization", "x-cookie"],
     },
     allowEIO3: true, // Allow Engine.IO v3 clients
-    // The live payloads on this socket are already MessagePack binary —
-    // compact, high-entropy bytes that gain little from gzip/deflate but
-    // still pay its CPU cost on every emit. Default perMessageDeflate was
-    // fighting the point of using a binary wire format; disable it.
-    perMessageDeflate: false,
+    // Benchmarked via scripts/benchmark-deflate.js (2026-08-17) against a
+    // realistic 20-team/80-player live-tick payload — the previous comment
+    // here claiming msgpack payloads are "high-entropy, gain little from
+    // deflate" was wrong: deflate level 6 cut msgpack by 87.3% (62.3KB ->
+    // 7.9KB) and protobuf by a further 66.9% even on top of protobuf's own
+    // much smaller baseline (17.1KB -> 5.6KB), at ~0.2-0.5ms/op — negligible
+    // against the ~2s live-tick cadence. threshold matches `ws`'s own
+    // default (1024 bytes) so small control events (matchCreated,
+    // pollingStatusUpdated, etc.) skip compression entirely.
+    perMessageDeflate: {
+      threshold: 1024,
+      zlibDeflateOptions: { level: 6 },
+    },
   });
+
   console.log('✅ Socket.IO initialized with CORS');
 
   return ioInstance;

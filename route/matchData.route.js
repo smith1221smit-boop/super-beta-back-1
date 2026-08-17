@@ -83,4 +83,13 @@ router.delete(
   matchDataController.removePlayersFromTeamInMatchData
 );
 
+// Bulk-copy the auto-detected previous match's roster into this match, per
+// team (matched by Team ref), resetting all live stats. Whole-match action —
+// no :teamId, unlike replace/add/remove above.
+router.post(
+  '/matchdata/:matchDataId/copy-previous-roster',
+  requireAuth,
+  matchDataController.copyRosterFromPreviousMatch
+);
+
 module.exports = router;

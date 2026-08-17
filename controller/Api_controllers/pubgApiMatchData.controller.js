@@ -11,6 +11,11 @@ const { getSocket } = require('../../socket');
 const { computeOverallMatchDataForRound } = require('../overall.controller');
 const { encodeMsgpack } = require('../../utils/msgpackCodec');
 const { updateDeadTeamList, hydrateMatchDataIdentity } = require('../Bulkpublic.controller');
+const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA } = require('../../utils/viewDataTiers');
+const { setSocketWireFormat, clearSocketWireFormat } = require('../../utils/socketFormatRegistry');
+const { emitToRoomSplitByFormat } = require('../../utils/roomEmit');
+const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
+const { computeChangedTeams } = require('../../utils/matchTeamDiff');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -394,7 +399,7 @@ function playerKeyOf(p) {
 // too. Plain `x || 0` doesn't catch it since -1 is truthy, so it was
 // leaking straight through to persisted/broadcast player data and showing
 // up as a literal "-1" on the overlay. Clamp explicitly at ingestion.
-const nonNeg = (v) => (typeof v === 'number' && v > 0) ? v : 0;
+const nonNeg = (v) => (typeof v === 'number' && v > 0) ? Math.trunc(v) : 0;
 
 // Every numeric player-stat field PCOB can supply, clamped via nonNeg (plus
 // healthMax's own positive-or-default-100 rule). Shared by both the
@@ -405,7 +410,7 @@ const nonNeg = (v) => (typeof v === 'number' && v > 0) ? v : 0;
 function clampedNumericPlayerStats(apiPlayer) {
   return {
     health:                nonNeg(apiPlayer.health),
-    healthMax:             (typeof apiPlayer.healthMax === 'number' && apiPlayer.healthMax > 0) ? apiPlayer.healthMax : 100,
+    healthMax:             (typeof apiPlayer.healthMax === 'number' && apiPlayer.healthMax > 0) ? Math.trunc(apiPlayer.healthMax) : 100,
     liveState:             nonNeg(apiPlayer.liveState),
     rank:                  nonNeg(apiPlayer.rank),
     killNum:               nonNeg(apiPlayer.killNum),
@@ -487,6 +492,11 @@ function computeOverallFingerprintParts(teams) {
 }
 
 const lastOverallFingerprintByUserMatch = {};
+// Full overallTeams array from the last tick actually emitted for this
+// cacheKey — diffed via computeChangedTeams (same helper the matchData path
+// uses) so a standings tick only resends the teams that actually changed,
+// instead of the entire round-wide roster every time any one team moves.
+const lastOverallTeamsByUserMatch = {};
 
 // Guards computeOverallMatchDataForRound (round-wide standings recompute —
 // scans every MatchData in the round and re-aggregates every player) from
@@ -572,6 +582,15 @@ function startLiveMatchUpdater() {
     if (sessionUserId) {
       socket.join(`user:${sessionUserId}`);
       console.log(c('cyan', `[socket] dashboard auto-joined room user:${sessionUserId} (${socket.id})`));
+
+      // Bandwidth: this dashboard socket can declare msgpack support for the
+      // user: room's liveMatchUpdate via ?msgpackLiveUpdate=1 on the connect
+      // query string. Absence = plain JSON (today's format) — PERMANENT
+      // negotiated default, not a flag meant to be deleted later (see
+      // splitUserRoomForLiveUpdate below for why).
+      const supportsMsgpack = socket.handshake.query?.msgpackLiveUpdate === '1';
+      socket.data.supportsMsgpackLiveUpdate = supportsMsgpack;
+      console.log(`[bw][wire-format] dashboard socket ${socket.id} supportsMsgpackLiveUpdate=${supportsMsgpack} (query=${JSON.stringify(socket.handshake.query?.msgpackLiveUpdate)})`);
     }
 
     // Each relay identifies which user it belongs to before pushing data.
@@ -784,18 +803,39 @@ function startLiveMatchUpdater() {
     // joinBulkRoom/leaveBulkRoom from comsock.js). Scoped per round rather
     // than per match so a followSelected overlay keeps receiving whichever
     // match is currently selected, without needing to rejoin on a switch.
-    socket.on('joinRoundRoom', ({ tournamentId, roundId } = {}) => {
+    socket.on('joinRoundRoom', ({ tournamentId, roundId, view, wireFormat } = {}) => {
       if (!tournamentId || !roundId) return;
-      socket.join(`round:${tournamentId}:${roundId}`);
+
+      if (wireFormat === 'protobuf') {
+        setSocketWireFormat(socket.id, 'protobuf');
+      }
+
+      const matchDataRoom = `round:${tournamentId}:${roundId}:matchData`;
+      const overallRoom = `round:${tournamentId}:${roundId}:overall`;
+
+      // A missing `view` means an old/pre-deploy overlay build (never sends
+      // it) — treat that as "needs everything" so an already-open OBS
+      // Browser Source mid-broadcast never silently goes dark because of a
+      // deploy. A recognized view only joins the tier(s) it actually needs.
+      const joinMatchData = !view || VIEWS_NEEDING_MATCH_DATA.has(view);
+      const joinOverall = !view || VIEWS_NEEDING_OVERALL.has(view);
+
+      if (joinMatchData) socket.join(matchDataRoom);
+      if (joinOverall) socket.join(overallRoom);
+
+      console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} overall=${joinOverall}`);
     });
 
     socket.on('leaveRoundRoom', ({ tournamentId, roundId } = {}) => {
       if (!tournamentId || !roundId) return;
-      socket.leave(`round:${tournamentId}:${roundId}`);
+      socket.leave(`round:${tournamentId}:${roundId}:matchData`);
+      socket.leave(`round:${tournamentId}:${roundId}:overall`);
+      console.log(`[bw][room] socket ${socket.id} leaveRoundRoom tournamentId=${tournamentId} roundId=${roundId}`);
     });
 
     socket.on('disconnect', () => {
       console.log(c('dim', `[socket] client disconnected: ${socket.id}`));
+      clearSocketWireFormat(socket.id);
       const userId = socketIdToUserId.get(socket.id);
       socketIdToUserId.delete(socket.id);
       if (!userId) return;
@@ -1092,9 +1132,19 @@ function startLiveMatchUpdater() {
     // cache the public bulk endpoints already rely on for "result" screens.
     hydrateMatchDataIdentity(matchData, tournamentId);
 
-    updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId, userId).catch(err =>
-      console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
-    );
+    // Reconcile the Teams collection exactly once per match, on the first
+    // tick that actually has live player data — not on every tick. A
+    // roster change mid-match is intentionally NOT chased after this;
+    // the next match's own first snapshot is what picks up a new lineup.
+    if (!matchData.rosterSynced && resolvedPlayersByTeamId.size > 0) {
+      updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId, userId).catch(err =>
+        console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
+      );
+      matchData.rosterSynced = true;
+      MatchData.updateOne({ matchId, userId }, { $set: { rosterSynced: true } }).catch(err =>
+        console.error(`[rosterSynced] user ${userId} match ${matchId}:`, err.message)
+      );
+    }
 
     const updatedObject = matchData;
     const cacheKey = `${String(userId)}:${String(matchId)}`;
@@ -1176,10 +1226,18 @@ function startLiveMatchUpdater() {
         // destinations:
         //   1. `user:${userKey}` — the authenticated dashboard
         //      (matchDataController.tsx), plain JSON, unchanged.
-        //   2. `round:${tournamentId}:${roundId}` — the public overlay
-        //      (PublicThemeRenderer.tsx), msgpack-encoded binary, no login
-        //      required. Always the FULL match/standings object, never a
-        //      diff — a missed tick just gets caught up by the next one.
+        //   2. `round:${tournamentId}:${roundId}:matchData` — the public
+        //      overlay (PublicThemeRenderer.tsx), protobuf/msgpack-encoded.
+        //      liveMatchUpdate here is now a TEAM-LEVEL DELTA — only teams
+        //      that actually changed since the last tick are included (see
+        //      computeChangedTeams / emitUpdates below). Safe because
+        //      processLiveMatchUpdate merges a partial `teams` array by
+        //      team ID client-side, keeping a team's last-known value when
+        //      it's absent from a given tick; a client that misses a delta
+        //      entirely self-heals via the next full HTTP bulk-fetch
+        //      (mount/view-change/match-switch), not via socket resend.
+        //      overallDataUpdate on the :overall sub-room is still the full
+        //      standings object every time — not delta'd (yet).
         //
         // computeOverallMatchDataForRound (round-wide standings) is fired
         // WITHOUT being awaited — it scans every MatchData in the round and
@@ -1205,19 +1263,43 @@ function startLiveMatchUpdater() {
             const unchangedOverall = fingerprintsEqual(overallFingerprint, lastOverallFingerprintByUserMatch[cacheKey]);
             lastOverallFingerprintByUserMatch[cacheKey] = overallFingerprint;
             if (!unchangedOverall) {
-              const overallPayload = {
-                tournamentId: selected.tournamentId,
-                roundId:      selected.roundId,
-                matchId:      selected.matchId,
-                teams:        overallTeams,
-                createdAt:    new Date()
-              };
-              // not volatile — overall standings should always land
-              io.to(`user:${userKey}`).emit('overallDataUpdate', overallPayload);
-              io.to(`round:${selected.tournamentId}:${selected.roundId}`).emit(
-                'overallDataUpdate',
-                encodeMsgpack(overallPayload)
-              );
+              // Team-level delta, mirroring the matchData path above: first
+              // tick for this (user, match) has no previous entry, so
+              // computeChangedTeams naturally returns the full roster.
+              // PublicThemeRenderer.tsx merges by teamId (same as
+              // liveMatchUpdate), keeping a team's last-known values when
+              // it's absent from a given tick rather than blanking it.
+              const changedOverallTeams = computeChangedTeams(overallTeams, lastOverallTeamsByUserMatch[cacheKey]);
+              lastOverallTeamsByUserMatch[cacheKey] = overallTeams;
+              const overallRoom = `round:${selected.tournamentId}:${selected.roundId}:overall`;
+              if (changedOverallTeams.length === 0) {
+                // Structurally near-impossible: the fingerprint gate above is
+                // a strict subset of what this full-object comparison
+                // covers. Logged loudly rather than silently skipped so a
+                // future divergence is visible.
+                console.warn(`[bw][overall-delta] ${cacheKey}: change gate fired but 0 teams differ — skipping ${overallRoom} emit this tick`);
+              } else {
+                const overallPayload = {
+                  tournamentId: selected.tournamentId,
+                  roundId:      selected.roundId,
+                  matchId:      selected.matchId,
+                  teams:        changedOverallTeams,
+                  createdAt:    new Date()
+                };
+                // not volatile — overall standings should always land.
+                // NOTE: no `user:${userKey}` emit here — confirmed zero
+                // consumers of overallDataUpdate on that room anywhere in
+                // front/ or desktop-app/ (only the public overlay listens,
+                // and only on the round:...:overall sub-room below). Removed
+                // as dead traffic; see plan step 1.
+                console.log(`[bw][overall-delta] ${cacheKey}: ${changedOverallTeams.length}/${overallTeams.length} teams changed -> ${overallRoom}`);
+                emitToRoomSplitByFormat(io, overallRoom, 'overallDataUpdate', {
+                  protoMessageName: 'OverallDataPayload',
+                  mapToProto: toProtoOverallDataPayload,
+                  data: overallPayload,
+                  volatile: false,
+                });
+              }
             }
           } catch (overallError) {
             console.warn('Failed to compute overall data:', overallError.message);
@@ -1231,18 +1313,53 @@ function startLiveMatchUpdater() {
 
           // volatile: if a client's socket buffer is backed up, drop this
           // frame rather than queueing — always prefer the freshest data.
-          io.to(`user:${userKey}`).volatile.emit('liveMatchUpdate', memoryMatch);
+          //
+          // Dashboard (user: room): split by negotiated format — a socket
+          // only gets msgpack once it opts in via ?msgpackLiveUpdate=1 (see
+          // socketFormatRegistry / the connection handler above). Absence =
+          // plain JSON, permanently, not just during a rollout window.
+          {
+            const userRoom = `user:${userKey}`;
+            const userRoomIds = io.sockets.adapter.rooms.get(userRoom);
+            if (userRoomIds && userRoomIds.size > 0) {
+              const msgpackTargets = [];
+              const plainTargets = [];
+              for (const id of userRoomIds) {
+                const s = io.sockets.sockets.get(id);
+                if (!s || s.data?.userId) continue; // relay sockets never listen for liveMatchUpdate
+                (s.data?.supportsMsgpackLiveUpdate ? msgpackTargets : plainTargets).push(id);
+              }
+              console.log(`[bw][emit] liveMatchUpdate -> ${userRoom}: msgpack=${msgpackTargets.length} plain=${plainTargets.length}`);
+              if (msgpackTargets.length) io.to(msgpackTargets).volatile.emit('liveMatchUpdate', encodeMsgpack(memoryMatch));
+              if (plainTargets.length) io.to(plainTargets).volatile.emit('liveMatchUpdate', memoryMatch);
+            }
+          }
 
-          // Public overlay: emit the full match object as soon as it's ready,
-          // msgpack-encoded, in one frame.
-          const roundRoom = `round:${selected.tournamentId}:${selected.roundId}`;
-          io.to(roundRoom).volatile.emit(
-            'liveMatchUpdate',
-            encodeMsgpack({
-              ...memoryMatch,
-              matchId: String(selected.matchId),
-            })
-          );
+          // Public overlay: only send the teams that actually changed since
+          // the last tick (team-level delta), to whichever sockets joined
+          // the matchData tier (view-scoped — see joinRoundRoom above),
+          // split by negotiated wire format (protobuf vs. msgpack). First
+          // tick for this (user, match) needs no special case: lastData is
+          // undefined, so every team fails the previous-team lookup and
+          // computeChangedTeams naturally returns the full roster.
+          const changedTeams = computeChangedTeams(memoryMatch.teams, lastData?.teams);
+          const matchDataRoom = `round:${selected.tournamentId}:${selected.roundId}:matchData`;
+          if (changedTeams.length === 0) {
+            // Structurally near-impossible: the top-level `changed` gate
+            // (TRACKED_FIELDS-based) is a strict subset of what this
+            // full-object comparison covers, so if `changed` fired, at
+            // least one team should differ here too. Logged loudly rather
+            // than silently skipped so a future divergence is visible.
+            console.warn(`[bw][delta] ${cacheKey}: change gate fired but 0 teams differ — skipping ${matchDataRoom} emit this tick`);
+          } else {
+            console.log(`[bw][delta] ${cacheKey}: ${changedTeams.length}/${memoryMatch.teams.length} teams changed -> ${matchDataRoom}`);
+            emitToRoomSplitByFormat(io, matchDataRoom, 'liveMatchUpdate', {
+              protoMessageName: 'MatchDataPayload',
+              mapToProto: toProtoMatchDataPayload,
+              data: { ...memoryMatch, teams: changedTeams, matchId: String(selected.matchId) },
+              volatile: true,
+            });
+          }
 
           emitOverallUpdate().catch(err =>
             console.error(`[overall] ${cacheKey} error:`, err.message)

@@ -1,17 +1,6 @@
 const Team = require('../../models/teams.model');
 const mongoose = require('mongoose');
 
-// Per-match cache of every uId already registered to some team, as of the
-// last full DB read. When this tick's resolved players contain no uId
-// outside that set, the loop below is guaranteed to be a no-op (every
-// player either already exists on their team, or is a known member of a
-// different team and gets skipped) — so we can skip the Team DB read
-// entirely instead of re-fetching every ~2s tick for a roster that isn't
-// actually changing. Short TTL so any out-of-band roster edit still gets
-// picked up quickly.
-const knownPlayersCache = new Map(); // matchId -> { uids: Set<string>, expiresAt }
-const KNOWN_PLAYERS_CACHE_TTL_MS = 10000;
-
 // Case-fold and strip whitespace/punctuation/symbols (Unicode-aware) before
 // comparing names for the roster-reconciliation fallback below — same
 // normalization pubgApiMatchData.controller.js applies for its own
@@ -43,27 +32,23 @@ const normalizeNameForMatch = name => String(name).toLowerCase().replace(/[\p{P}
  * almost certainly a typo/stale value (the dominant real cause of a player
  * staying unmatched, per the name-fallback in pubgApiMatchData.controller.js),
  * so correct it in place rather than treating this as a new player; (3)
- * neither matches — genuinely new player, appended if the team has room.
+ * neither matches — genuinely new player, appended if the team has room, or
+ * swapped into a registered slot that didn't appear in this tick's live data
+ * (a substitute) if the roster is already at MAX_PLAYERS. New players are
+ * added with a blank photo — that's filled in later by a human, not from
+ * the live API.
+ *
+ * Called exactly once per match, by the caller, on the first tick that has
+ * real live player data (see MatchData's `rosterSynced` flag) — not on
+ * every tick.
  *
  * @param {Map<string, Array>} resolvedPlayersByTeamId - team DB _id (string) -> apiPlayer[]
- * @param {String} matchId - only used for the knownPlayersCache key/logging
+ * @param {String} matchId - only used for logging
  */
 async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
   try {
     const matchKey = String(matchId);
     if (!resolvedPlayersByTeamId || resolvedPlayersByTeamId.size === 0) return;
-
-    const allApiPlayers = [];
-    for (const players of resolvedPlayersByTeamId.values()) allApiPlayers.push(...players);
-
-    const cached = knownPlayersCache.get(matchKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      const hasNewUid = allApiPlayers.some(p => {
-        const uId = p.uId;
-        return uId && uId !== 'undefined' && uId !== '' && !cached.uids.has(String(uId));
-      });
-      if (!hasNewUid) return;
-    }
 
     let newPlayersAdded = 0;
     let skipCount = 0;
@@ -79,12 +64,10 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
     // re-adding it — this roster is shared across tournaments, so a bad
     // guess here corrupts it permanently, not just this one match.
     const knownUidToTeamId = new Map();
-    const allKnownUids = new Set();
     for (const team of teams) {
       for (const p of team.players || []) {
         if (p.playerId) {
           knownUidToTeamId.set(String(p.playerId), team._id.toString());
-          allKnownUids.add(String(p.playerId));
         }
       }
     }
@@ -97,6 +80,16 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
     for (const [teamDbId, apiPlayersForTeam] of resolvedPlayersByTeamId) {
       const team = teamMap[teamDbId];
       if (!team) continue;
+
+      // This tick's live UIDs for the team — used below to tell a
+      // genuinely-absent (substituted-out) roster slot apart from one
+      // that's just temporarily unreported.
+      const currentTickUids = new Set(
+        apiPlayersForTeam
+          .map(p => p.uId)
+          .filter(uid => uid && uid !== 'undefined' && uid !== '')
+          .map(String)
+      );
 
       for (const apiPlayer of apiPlayersForTeam) {
         const uId = apiPlayer.uId;
@@ -140,14 +133,33 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
           }
           modifiedTeams.add(team);
           knownUidToTeamId.set(String(uId), String(team._id));
-          allKnownUids.add(String(uId));
           reconciledCount++;
           continue;
         }
 
         // Case 3: genuinely new player.
         if (team.players.length >= MAX_PLAYERS) {
-          console.warn(`[roster-full] match=${matchKey} team=${team._id} uId=${uId} playerName="${latestName}" — team already has ${MAX_PLAYERS} players and no name match; not added`);
+          // Roster's full — but if one of the 4 registered players isn't
+          // part of THIS tick's live data, they've been substituted out,
+          // so swap the new player into that slot instead of dropping them.
+          const staleIndex = team.players.findIndex(
+            p => p.playerId && !currentTickUids.has(String(p.playerId))
+          );
+
+          if (staleIndex === -1) {
+            console.warn(`[roster-full] match=${matchKey} team=${team._id} uId=${uId} playerName="${latestName}" — team already has ${MAX_PLAYERS} players and no stale slot to replace; not added`);
+            continue;
+          }
+
+          const stale = team.players[staleIndex];
+          console.log(`[REPLACED] match=${matchKey} team=${team._id} ${stale.playerId}(${stale.playerName}) -> ${uId}(${latestName})`);
+          stale.playerId = String(uId);
+          stale.playerName = latestName;
+          stale.photo = '';
+
+          modifiedTeams.add(team);
+          knownUidToTeamId.set(String(uId), String(team._id));
+          newPlayersAdded++;
           continue;
         }
 
@@ -155,12 +167,11 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
           _id: new mongoose.Types.ObjectId(),
           playerName: latestName,
           playerId: String(uId),
-          photo: apiPlayer.picUrl || ''
+          photo: ''
         });
 
         modifiedTeams.add(team);
         knownUidToTeamId.set(String(uId), String(team._id));
-        allKnownUids.add(String(uId));
         newPlayersAdded++;
       }
     }
@@ -177,11 +188,6 @@ async function updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId) {
         })
       );
     }
-
-    knownPlayersCache.set(matchKey, {
-      uids: allKnownUids,
-      expiresAt: Date.now() + KNOWN_PLAYERS_CACHE_TTL_MS,
-    });
 
     // Finished - silent
     if (skipCount > 0) {

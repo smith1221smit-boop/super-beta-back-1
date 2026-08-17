@@ -118,7 +118,12 @@ const matchDataSchema = new Schema({
   createdAt: {
     type: Date,
     default: Date.now
-  }
+  },
+  // Set once this match's first live snapshot has been reconciled against
+  // the Teams collection (see playerCheckandSwitch.js) — the sync only
+  // ever runs once per match, so this flag has to be persisted rather than
+  // tracked in memory.
+  rosterSynced: { type: Boolean, default: false }
 });
 
 module.exports = mongoose.model('MatchData', matchDataSchema);

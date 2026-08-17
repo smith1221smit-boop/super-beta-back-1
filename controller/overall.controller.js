@@ -5,6 +5,8 @@ const Round = require('../models/round.model');
 const Tournament = require('../models/tournament.model');
 const { getSocket } = require('../socket');
 const { encodeMsgpack } = require('../utils/msgpackCodec');
+const { emitToRoomSplitByFormat } = require('../utils/roomEmit');
+const { toProtoOverallDataPayload } = require('../utils/protobufCodec');
 
 // Numeric player fields to aggregate (sum)
 const NUMERIC_PLAYER_FIELDS = [
@@ -45,7 +47,7 @@ const NUMERIC_PLAYER_FIELDS = [
 // yet" sentinel on fields like rank) since it's truthy — same bug class
 // documented in pubgApiMatchData.controller.js's `nonNeg`. Guard explicitly
 // so a leaked negative never sums straight into the round-wide aggregate.
-const nonNeg = (v) => (typeof v === 'number' && v > 0) ? v : 0;
+const nonNeg = (v) => (typeof v === 'number' && v > 0) ? Math.trunc(v) : 0;
 
 function sumNumericFields(target, source, fields) {
   for (const f of fields) {
@@ -364,16 +366,18 @@ const getOverallMatchDataForRound = async (req, res) => {
     // tournament's standings to every connected socket).
     try {
       const io = getSocket();
-      const room = `round:${tournamentId}:${roundId}`;
-      console.log(`[socket] overallDataUpdate -> ${room}`);
+      const room = `round:${tournamentId}:${roundId}:overall`;
+      console.log(`[bw][overall] overallDataUpdate (HTTP-triggered) -> ${room} teams=${aggregatedTeams.length}`);
       // This room is the public overlay's (PublicThemeRenderer.tsx) —
-      // it always decodes overallDataUpdate as MessagePack binary, so this
-      // MUST be encoded, unlike the plain-JSON user:${userId} emits used
-      // elsewhere for the authenticated dashboard.
-      io.to(room).emit(
-        'overallDataUpdate',
-        encodeMsgpack({ tournamentId, roundId, matchId, teams: aggregatedTeams, createdAt: new Date() })
-      );
+      // always encoded (protobuf or msgpack per each socket's negotiated
+      // format), unlike the plain-JSON user:${userId} emits used elsewhere
+      // for the authenticated dashboard.
+      emitToRoomSplitByFormat(io, room, 'overallDataUpdate', {
+        protoMessageName: 'OverallDataPayload',
+        mapToProto: toProtoOverallDataPayload,
+        data: { tournamentId, roundId, matchId, teams: aggregatedTeams, createdAt: new Date() },
+        volatile: false,
+      });
     } catch (socketError) {
       console.warn('Failed to emit overall data via socket:', socketError.message);
     }
