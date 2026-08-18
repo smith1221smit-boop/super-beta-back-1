@@ -150,6 +150,83 @@ const createTeam = async (req, res) => {
   }
 };
 
+// ─── Bulk-create teams (CSV import) ─────────────────────────────────────
+// Same per-team rules as createTeam, run in a loop so one bad row (a stale
+// tag, a malformed player UID) can't sink the rest of a 100+-team import.
+// Sequential, not Promise.all: keeps unique-tag (E11000) errors attributable
+// to the exact team that caused them and avoids hammering the connection
+// pool with a huge batch of concurrent writes.
+const MAX_BULK_TEAMS = 1000;
+
+const bulkImportTeams = async (req, res) => {
+  try {
+    const { teams } = req.body;
+    if (!Array.isArray(teams) || teams.length === 0) {
+      return res.status(400).json({ error: 'teams must be a non-empty array' });
+    }
+    if (teams.length > MAX_BULK_TEAMS) {
+      return res.status(400).json({ error: `Cannot import more than ${MAX_BULK_TEAMS} teams in one request` });
+    }
+
+    const created = [];
+    const failed = [];
+    const tagsInThisBatch = new Set();
+
+    for (const raw of teams) {
+      const { teamFullName, teamTag, logo, teamFlag, players } = raw || {};
+      const label = teamFullName || teamTag || '(unnamed)';
+      try {
+        if (!teamFullName || !teamTag) {
+          throw new Error('Team full name and tag are required');
+        }
+        if (tagsInThisBatch.has(teamTag)) {
+          throw new Error(`Duplicate tag "${teamTag}" within this import`);
+        }
+        if (players !== undefined && !Array.isArray(players)) {
+          throw new Error('players must be an array');
+        }
+        if (Array.isArray(players) && players.length > MAX_PLAYERS) {
+          throw new Error(`players cannot exceed ${MAX_PLAYERS}`);
+        }
+        if (Array.isArray(players) && players.length) {
+          const validation = validatePlayerIds(players);
+          if (!validation.ok) throw new Error(validation.error);
+        }
+
+        const finalLogo = (typeof logo === 'string' && logo.trim()) ? logo : DEFAULT_TEAM_LOGO;
+        const finalFlag = (typeof teamFlag === 'string' && teamFlag.trim()) ? teamFlag : DEFAULT_TEAM_FLAG;
+        const normalizedPlayers = normalizePlayers(players);
+
+        const team = new Team({
+          teamFullName,
+          teamTag,
+          logo: finalLogo,
+          teamFlag: finalFlag,
+          createdBy: req.session.userId,
+          players: normalizedPlayers,
+        });
+        const savedTeam = await team.save();
+        tagsInThisBatch.add(teamTag);
+        created.push(sanitizeTeam(savedTeam.toObject(), req.session?.userId));
+      } catch (err) {
+        const reason = err.code === 11000 ? 'A team with that tag already exists' : err.message;
+        failed.push({ teamFullName: label, teamTag, reason });
+      }
+    }
+
+    console.log(`[TEAMS] bulk-import created=${created.length} failed=${failed.length}`);
+    res.status(created.length ? 201 : 400).json({
+      createdCount: created.length,
+      failedCount: failed.length,
+      created,
+      failed,
+    });
+  } catch (err) {
+    console.error(`[ERROR] team=bulk-import-failed msg=${err.message}`);
+    res.status(400).json({ error: err.message });
+  }
+};
+
 // ─── Get team by ID ──────────────────────────────────────────────────────
 const getTeamById = async (req, res) => {
   try {
@@ -441,6 +518,7 @@ const removeMultiplePlayersFromTeam = async (req, res) => {
 
 module.exports = {
   createTeam,
+  bulkImportTeams,
   getAllTeams,
   getTeamById,
   updateTeam,

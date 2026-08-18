@@ -14,6 +14,9 @@ const requireAuth = require('../authMiddleware.js');
 // Create a new team
 router.post('/teams', requireAuth, invalidateCacheMiddleware(['cache:/api/teams', 'cache:/api/matches', 'cache:/api/groups']), teamController.createTeam);
 
+// Bulk-create teams (CSV import) — same rules as createTeam, one bad row can't sink the batch
+router.post('/teams/bulk-import', requireAuth, invalidateCacheMiddleware(['cache:/api/teams', 'cache:/api/matches', 'cache:/api/groups']), teamController.bulkImportTeams);
+
 // Get all teams
 router.get('/teams', cacheMiddleware(), teamController.getAllTeams);
 

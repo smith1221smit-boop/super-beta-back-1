@@ -1092,14 +1092,26 @@ function startLiveMatchUpdater() {
         usedUIds.add(uid);
       }
 
+      // null (not 0) when this tick reported no live players for this team
+      // at all — 0 is a real rank value ("still alive, unplaced"), so it
+      // must stay distinguishable from "no data this tick." Without this
+      // distinction, any single tick with an empty/missing live feed for an
+      // already-ranked team (API gap, PCOB reconnect, timing jitter around
+      // their elimination) would blow away their earned placePoints back to
+      // 0 below, then have it jump back up once good data resumed — which
+      // is exactly the "overall total flickers down and up" symptom, since
+      // computeOverallMatchDataForRound sums this field live every tick.
       const teamRank = newTeamPlayers.length
         ? Math.min(...newTeamPlayers.map(p => p.rank || 0))
-        : 0;
+        : null;
 
       // A manual correction via updateTeamPoints locks placePoints/rank —
       // leave them alone until an operator explicitly unlocks, instead of
-      // silently reverting the correction on this tick.
-      if (!team.placePointsLocked) {
+      // silently reverting the correction on this tick. Same treatment for
+      // a no-data tick (teamRank === null): keep the last-known rank/points
+      // rather than resetting them, mirroring how team.players below is
+      // allowed to go empty without that being read as "eliminated."
+      if (!team.placePointsLocked && teamRank !== null) {
         team.rank = teamRank;
         team.placePoints = ((rank) => {
           switch (rank) {

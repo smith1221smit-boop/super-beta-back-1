@@ -227,17 +227,35 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
 // always do; the key-list path just makes it surgical when a call site
 // bothers to specify what actually changed.
 invalidateCacheMiddleware = (keysOrFn) => {
-  return async (req, res, next) => {
+  return (req, res, next) => {
     if (!['POST', 'PUT', 'DELETE'].includes(req.method)) return next();
 
+    // Deferred until the controller actually calls res.json (same res.json
+    // patch pattern cacheMiddleware above uses for the SET side), instead
+    // of running eagerly here before the controller has done anything.
+    // Invalidating up front left a window spanning the controller's own
+    // write sequence (often several awaited DB calls) where any GET could
+    // land, find the cache already cleared but the write not yet done, and
+    // re-cache the stale pre-write result for the full TTL — with nothing
+    // left to clear it afterward. That's what made "create a match, list
+    // still looks empty" possible.
     const scope = req.session?.userId?.toString() || req.sessionID || 'anon';
     const keys = typeof keysOrFn === 'function' ? keysOrFn(req) : keysOrFn;
 
-    if (Array.isArray(keys) && keys.length) {
-      await invalidateKeysByPrefix(scope, keys);
-    } else {
-      await invalidateScope(scope);
-    }
+    const originalJson = res.json.bind(res);
+    res.json = (data) => {
+      // Only on success — mirrors cacheMiddleware's own res.statusCode
+      // guard. A failed write (400/500) changed nothing, so there's
+      // nothing to invalidate.
+      if (res.statusCode < 200 || res.statusCode >= 300) return originalJson(data);
+      const invalidate = (Array.isArray(keys) && keys.length)
+        ? invalidateKeysByPrefix(scope, keys)
+        : invalidateScope(scope);
+      invalidate
+        .catch(err => console.warn('Cache invalidation error:', err.message))
+        .then(() => originalJson(data));
+    };
+
     next();
   };
 };

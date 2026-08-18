@@ -146,7 +146,9 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+// Default 100kb is too small for CSV bulk-team-import payloads (100+ teams
+// with per-player Cloudinary photo URLs easily exceeds it).
+app.use(express.json({ limit: '15mb' }));
 
 // Enhanced middleware for handling cookies and security headers
 app.use((req, res, next) => {
@@ -195,13 +197,13 @@ const sessionMiddleware = session({
   store: sessionStore,
   proxy: true, // Trust the reverse proxy (important for HTTPS)
   cookie: {
-      secure: true, // Only secure in true production, not local IP
-    httpOnly: true, // Prevent client-side JS from accessing the cookie
-    sameSite: 'none', // 'none' only for true production
+      secure: false, // Only secure in true production, not local IP
+    httpOnly: false, // Prevent client-side JS from accessing the cookie
+    sameSite: 'lax', // 'none' only for true production
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     domain: undefined, // Don't set domain for cross-site cookies between different TLDs
     path: '/',
-    partitioned: true // Only partitioned in true production
+    partitioned: false // Only partitioned in true production
   },
   rolling: true // Reset the expiration on every request
 });
