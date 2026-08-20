@@ -52,31 +52,57 @@ const killChangeResult = computeChangedTeams(tick4, tick1);
   ? pass(`killNum change on team 11: correctly isolated (${killChangeResult.length} team returned, ${((1 - 1/24) * 100).toFixed(0)}% smaller than full snapshot)`)
   : fail(`killNum change: expected exactly team 11, got ${JSON.stringify(killChangeResult.map((t) => t.slot))}`);
 
-// --- 5. Client-side merge contract: a team omitted from a delta retains its last-known value ---
-// Ported verbatim (structure) from PublicThemeRenderer.tsx's processLiveMatchUpdate merge block.
+// --- 5. Client-side merge contract: a team/player omitted from a delta retains its last-known value ---
+// Ported (structure) from PublicThemeRenderer.tsx's processLiveMatchUpdate merge block, now
+// with a SECOND, DIFFERENT merge rule one level deeper: a delta'd team's own scalar fields
+// (teamName/placePoints/etc) are always complete when the team is present at all (backend
+// still sends those in full), but its `players` array is partial — only players that actually
+// changed — so each present player must be SHALLOW-MERGED onto the previous full player
+// object (keeping fields the delta omitted), not wholesale-replaced like a team is.
+const teamKeyFn = (t) => String(t.teamId ?? t._id);
+const playerKeyFn = (p) => String(p.docId ?? p._id);
+
 function clientMerge(prevTeams, incomingTeams) {
-  const incomingById = new Map(incomingTeams.map((t) => [String(t.teamId ?? t._id), t]));
-  const mergedTeams = prevTeams.map((t) => {
-    const key = String(t.teamId ?? t._id);
-    return incomingById.has(key) ? incomingById.get(key) : t;
+  const incomingById = new Map(incomingTeams.map((t) => [teamKeyFn(t), t]));
+
+  const merged = prevTeams.map((prevTeam) => {
+    const incomingTeam = incomingById.get(teamKeyFn(prevTeam));
+    if (!incomingTeam) return prevTeam; // team wasn't in the delta at all — untouched
+
+    const incomingPlayersById = new Map((incomingTeam.players || []).map((p) => [playerKeyFn(p), p]));
+    const mergedPlayers = (prevTeam.players || []).map((prevPlayer) => {
+      const incomingPlayer = incomingPlayersById.get(playerKeyFn(prevPlayer));
+      return incomingPlayer ? { ...prevPlayer, ...incomingPlayer } : prevPlayer;
+    });
+    const knownPlayerIds = new Set((prevTeam.players || []).map(playerKeyFn));
+    for (const p of incomingTeam.players || []) {
+      if (!knownPlayerIds.has(playerKeyFn(p))) mergedPlayers.push(p); // new player, first tick for them
+    }
+
+    return { ...prevTeam, ...incomingTeam, players: mergedPlayers };
   });
-  const knownIds = new Set(prevTeams.map((t) => String(t.teamId ?? t._id)));
+
+  const knownTeamIds = new Set(prevTeams.map(teamKeyFn));
   for (const t of incomingTeams) {
-    const key = String(t.teamId ?? t._id);
-    if (!knownIds.has(key)) mergedTeams.push(t);
+    if (!knownTeamIds.has(teamKeyFn(t))) merged.push(t); // new team, first tick for it
   }
-  return mergedTeams;
+  return merged;
 }
 
 const clientPrevState = tick1; // client's last-known full state
-const backendDelta = killChangeResult; // only team 11, per test 4
+const backendDelta = killChangeResult; // only team 11, with only its changed player, per test 4
 const merged = clientMerge(clientPrevState, backendDelta);
 const mergedTeam11 = merged.find((t) => t.slot === 11);
 const mergedTeam1 = merged.find((t) => t.slot === 1); // untouched, should be byte-identical to original
 
-(merged.length === 24 && mergedTeam11.players[1].killNum === 3 && JSON.stringify(mergedTeam1) === JSON.stringify(tick1[0]))
-  ? pass(`Client merge: 24 teams after merge, team 11 got the update, team 1 (omitted from delta) retained its exact prior value`)
-  : fail(`Client merge: length=${merged.length}, team11.killNum=${mergedTeam11?.players[1]?.killNum}, team1 unchanged=${JSON.stringify(mergedTeam1) === JSON.stringify(tick1[0])}`);
+(merged.length === 24
+  && backendDelta[0].players.length === 1 // backend only sent the ONE player that actually changed
+  && mergedTeam11.players.length === 2 // client still has both players after merge
+  && mergedTeam11.players[1].killNum === 3 // the changed player got the update
+  && mergedTeam11.players[0].killNum === 0 // the untouched sibling player kept its prior value
+  && JSON.stringify(mergedTeam1) === JSON.stringify(tick1[0]))
+  ? pass(`Client merge: 24 teams after merge, team 11's changed player got the update, its untouched teammate and team 1 (omitted from delta) both retained their exact prior values`)
+  : fail(`Client merge: length=${merged.length}, deltaPlayers=${backendDelta[0]?.players?.length}, team11.players=${mergedTeam11?.players?.length}, team11.p1.killNum=${mergedTeam11?.players[1]?.killNum}, team1 unchanged=${JSON.stringify(mergedTeam1) === JSON.stringify(tick1[0])}`);
 
 console.log('\n=== TEAM DELTA VERIFICATION RESULTS ===');
 results.forEach((r) => console.log(r));

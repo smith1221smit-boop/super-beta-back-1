@@ -17,10 +17,28 @@ const { normalizeWireValue } = require('./wireNormalize');
 // so a stray float never breaks encoding regardless of which layer let it through.
 const toInt32 = (v) => Math.trunc(Number(v)) || 0;
 
+// Player-level delta (matchTeamDiff.js's computeChangedPlayers /
+// computeChangedPlayerFields) may hand this mapper a PARTIAL player object —
+// only the identity fields plus whatever else actually changed since the
+// last tick. The fields below are declared `optional` in overlay.proto
+// specifically so an absent one costs 0 wire bytes instead of falsely
+// encoding "changed to 0/false" — so each is only set on the output when
+// the source object actually has it, never defaulted. Only reachable on a
+// genuinely-new player (no `previous` in computeChangedPlayerFields, so the
+// FULL object is handed through) does every field end up present anyway.
+const OPTIONAL_INT_FIELDS = [
+  'health', 'healthMax', 'liveState', 'killNum', 'killNumBeforeDie',
+  'gotAirDropNum', 'maxKillDistance', 'damage', 'killNumInVehicle',
+  'killNumByGrenade', 'rank', 'headShotNum', 'survivalTime', 'driveDistance',
+  'marchDistance', 'assists', 'knockouts', 'rescueTimes',
+  'useSmokeGrenadeNum', 'useFragGrenadeNum', 'useBurnGrenadeNum',
+  'useFlashGrenadeNum', 'contribution', 'heal',
+];
+const OPTIONAL_BOOL_FIELDS = ['isFiring', 'bHasDied', 'isOutsideBlueCircle'];
+
 function toProtoPlayer(p) {
   if (!p) return null;
-  const loc = p.location || {};
-  return {
+  const out = {
     uId: String(p.uId ?? ''),
     playerName: p.playerName || '',
     playerOpenId: p.playerOpenId || '',
@@ -30,54 +48,41 @@ function toProtoPlayer(p) {
     teamIdfromApi: toInt32(p.teamIdfromApi),
     teamId: toInt32(p.teamId),
     teamName: p.teamName || '',
-    location: { x: Number(loc.x) || 0, y: Number(loc.y) || 0, z: Number(loc.z) || 0 },
-    health: toInt32(p.health),
-    healthMax: toInt32(p.healthMax),
-    liveState: toInt32(p.liveState),
-    isFiring: !!p.isFiring,
-    bHasDied: !!p.bHasDied,
-    isOutsideBlueCircle: !!p.isOutsideBlueCircle,
-    killNum: toInt32(p.killNum),
-    killNumBeforeDie: toInt32(p.killNumBeforeDie),
-    gotAirDropNum: toInt32(p.gotAirDropNum),
-    maxKillDistance: toInt32(p.maxKillDistance),
-    damage: toInt32(p.damage),
-    killNumInVehicle: toInt32(p.killNumInVehicle),
-    killNumByGrenade: toInt32(p.killNumByGrenade),
     // These 7 fields are confirmed dead weight: no front/src/Themes view
     // component reads any of them, on any view — grepped all of front/src,
-    // only the mirrored proto schema files reference the names. proto3
-    // omits a scalar field from the wire entirely at its zero default, so
-    // hardcoding 0 here (instead of toInt32(p.field)) is a guaranteed,
-    // unconditional size cut on every protobuf tick. Scoped to this mapper
-    // only — DB persistence and the dashboard's own raw-object msgpack feed
-    // (pubgApiMatchData.controller.js's emitUpdates) are untouched.
+    // only the mirrored proto schema files reference the names. Kept
+    // non-optional in the schema on purpose (see overlay.proto) — proto3
+    // already omits a non-optional zero-valued scalar from the wire for
+    // free, so hardcoding 0 here is a guaranteed, unconditional size cut on
+    // every protobuf tick with no extra presence-tracking needed. Scoped to
+    // this mapper only — DB persistence and the dashboard's own raw-object
+    // msgpack feed (pubgApiMatchData.controller.js's emitUpdates) are
+    // untouched.
     AIKillNum: 0,
     BossKillNum: 0,
-    rank: toInt32(p.rank),
     inDamage: 0,
-    headShotNum: toInt32(p.headShotNum),
-    survivalTime: toInt32(p.survivalTime),
-    driveDistance: toInt32(p.driveDistance),
-    marchDistance: toInt32(p.marchDistance),
-    assists: toInt32(p.assists),
     outsideBlueCircleTime: 0,
-    knockouts: toInt32(p.knockouts),
-    rescueTimes: toInt32(p.rescueTimes),
-    useSmokeGrenadeNum: toInt32(p.useSmokeGrenadeNum),
-    useFragGrenadeNum: toInt32(p.useFragGrenadeNum),
-    useBurnGrenadeNum: toInt32(p.useBurnGrenadeNum),
-    useFlashGrenadeNum: toInt32(p.useFlashGrenadeNum),
     PoisonTotalDamage: 0,
     UseSelfRescueTime: 0,
     UseEmergencyCallTime: 0,
-    contribution: toInt32(p.contribution),
-    heal: toInt32(p.heal),
     // p._id is a Mongoose ObjectId instance here (pre-normalization) or
     // already a hex string if this player object was itself already
     // normalized upstream — String() handles both.
     docId: String(p._id ?? ''),
   };
+
+  if (p.location !== undefined) {
+    const loc = p.location || {};
+    out.location = { x: Number(loc.x) || 0, y: Number(loc.y) || 0, z: Number(loc.z) || 0 };
+  }
+  for (const key of OPTIONAL_INT_FIELDS) {
+    if (p[key] !== undefined) out[key] = toInt32(p[key]);
+  }
+  for (const key of OPTIONAL_BOOL_FIELDS) {
+    if (p[key] !== undefined) out[key] = !!p[key];
+  }
+
+  return out;
 }
 
 function toProtoTeam(t) {

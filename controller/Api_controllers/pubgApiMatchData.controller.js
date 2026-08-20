@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const zlib = require('zlib');
 const mongoose = require('mongoose');
 const { decode } = require('@msgpack/msgpack');
 const MatchSelection = require('../../models/MatchSelection.model');
@@ -15,7 +16,7 @@ const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA } = require('../../utils
 const { setSocketWireFormat, clearSocketWireFormat } = require('../../utils/socketFormatRegistry');
 const { emitToRoomSplitByFormat } = require('../../utils/roomEmit');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
-const { computeChangedTeams } = require('../../utils/matchTeamDiff');
+const { computeChangedTeams, TRACKED_FIELDS } = require('../../utils/matchTeamDiff');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -445,12 +446,9 @@ function clampedNumericPlayerStats(apiPlayer) {
 // ─── Cheap Fingerprinting (replaces full-object MD5 hashing on hot path) ─────
 // Hashing the entire match object (including location/inventory noise) on
 // every tick is wasted CPU. We only care about the fields logMatchDiff
-// actually tracks, so fingerprint just those.
-const TRACKED_FIELDS = [
-  'killNum', 'health', 'damage', 'assists', 'knockouts',
-  'liveState', 'bHasDied', 'headShotNum', 'survivalTime',
-  'rescueTimes', 'inDamage', 'heal', 'rank',
-];
+// actually tracks, so fingerprint just those. TRACKED_FIELDS now lives in
+// matchTeamDiff.js (imported above) so this gate and the player-level delta
+// diff share one source of truth instead of drifting.
 
 // Returns the raw parts array instead of hashing it — comparing two arrays
 // element-by-element is cheaper than an MD5 digest on every tick, and we
@@ -555,7 +553,16 @@ const socketIdToUserId = new Map();
 // instead of requiring every relay to update in lockstep with this server.
 function decodeTotalPlayerListPayload(raw) {
   if (Buffer.isBuffer(raw) || raw instanceof Uint8Array || raw instanceof ArrayBuffer) {
-    return decode(raw);
+    const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    if (buf.length > 0 && buf[0] === 0x01) {
+      // 0x01 prefix = raw-deflate-compressed msgpack (see fetcher.rs's
+      // to_msgpack). A valid top-level msgpack map/array encoding never
+      // starts with 0x01, so this byte unambiguously distinguishes the
+      // compressed format from legacy raw msgpack — no per-connection
+      // negotiation needed, safe across a mixed-version relay rollout.
+      return decode(zlib.inflateRawSync(buf.subarray(1)));
+    }
+    return decode(buf);
   }
   // Already a plain object/array — nothing to decode (back-compat path).
   return raw;
@@ -657,12 +664,23 @@ function startLiveMatchUpdater() {
   // (see the totalPlayerList handler's isFull branch), so a genuine
   // reset (e.g. a real new match) is unaffected.
   const existing = relayStateByUser.get(key);
-  relayStateByUser.set(key, {
-    socketId: socket.id,
-    lastReceivedSeq: null,
-    players: existing?.players ?? new Map(),
-  });
-  socket.emit('requestFullSnapshot');
+  if (existing?.socketId === socket.id) {
+    // Same socket re-registering — e.g. the relay's periodic 20s keepalive
+    // re-emitting registerRelay on a connection that never dropped. Nothing
+    // about the connection actually changed, so don't reset the seq
+    // baseline or force a full-roster resync: that used to happen on
+    // EVERY keepalive, unconditionally re-sending the entire accumulated
+    // roster every 20 seconds for the whole broadcast regardless of
+    // whether anything changed, completely bypassing the delta protocol.
+    console.debug(`[socket] registerRelay keepalive from already-registered socket ${socket.id} (user=${key}) — skipping resync`);
+  } else {
+    relayStateByUser.set(key, {
+      socketId: socket.id,
+      lastReceivedSeq: null,
+      players: existing?.players ?? new Map(),
+    });
+    socket.emit('requestFullSnapshot');
+  }
 
   console.log(c('cyan', `[socket] relay registered → user ${key} (${socket.id})`));
 });
@@ -695,7 +713,16 @@ function startLiveMatchUpdater() {
       try {
         data = decodeTotalPlayerListPayload(raw);
       } catch (e) {
+        // TEMP DIAGNOSTIC (see plan doc "Part B"): every decode failure so
+        // far has consumed exactly 1 byte before erroring, which only
+        // happens on the no-inflate branch of decodeTotalPlayerListPayload
+        // — i.e. buf[0] is never the expected 0x01 prefix. Logging the raw
+        // type/length/leading bytes pins down exactly what's arriving
+        // instead of the expected [0x01, ...deflate-compressed msgpack].
+        const isBuf = Buffer.isBuffer(raw) || raw instanceof Uint8Array || raw instanceof ArrayBuffer;
+        const buf = isBuf ? (Buffer.isBuffer(raw) ? raw : Buffer.from(raw)) : null;
         console.error(c('red', `[socket] failed to decode msgpack totalPlayerList from ${socket.id} (user=${userId}): ${e.message}`));
+        console.error(c('red', `[socket][diag] raw type=${isBuf ? 'binary' : typeof raw} length=${buf ? buf.length : (raw?.length ?? 'n/a')} first16Hex=${buf ? buf.subarray(0, 16).toString('hex') : 'n/a'}`));
         return;
       }
 
@@ -761,7 +788,18 @@ function startLiveMatchUpdater() {
         }
         for (const p of incomingPlayers) {
           const uid = playerKeyOf(p);
-          if (uid != null) state.players.set(uid, p); // update-in-place/insert, never remove
+          if (uid != null) {
+            // Shallow-merge rather than overwrite: the relay already sends
+            // field-level patches for an existing player (fetcher.rs's
+            // field_diff — only the fields that actually changed, plus
+            // uId), not a complete object. This merge is what makes that
+            // safe — an overwrite would silently null out every field the
+            // patch didn't include. Only a brand-new player (no prior
+            // baseline on the relay side) or a full-snapshot tick ever
+            // arrives here as a complete object.
+            const prev = state.players.get(uid);
+            state.players.set(uid, prev ? { ...prev, ...p } : p);
+          }
         }
         state.lastReceivedSeq = wireSeq;
       }

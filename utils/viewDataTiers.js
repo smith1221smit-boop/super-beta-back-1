@@ -17,7 +17,7 @@ const VIEWS_NEEDING_MATCH_DATA = new Set([
   'Upper', 'Dom', 'Alerts', 'LiveStats', 'LiveFrags', 'MatchData', 'Achive', 'MatchFragrs',
   'WwcdSummary', 'WwcdStats', 'playerH2H', 'mapPreview', 'slots', 'TeamH2H', 'mvp',
   'RosterShowCase', 'MatchSummary', 'Champions', '1stRunnerUp', '2ndRunnerUp', 'EventMvp',
-  'PlayerSwitch', 'LiveData',
+  'PlayerSwitch', 'LiveData', 'Recall',
 ]);
 
 module.exports = { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA };
